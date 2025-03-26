@@ -1,0 +1,175 @@
+name: Deploy Admin Dashboard with Zero Downtime
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Current Active Port
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # Set the specific admin configuration file path
+            NGINX_CONFIG="/etc/nginx/sites-available/admin.empowertech.be"
+            echo "Using Nginx config: $NGINX_CONFIG"
+            
+            # Check which port is currently active by examining the Nginx config
+            if grep -q "server localhost:3000;" "$NGINX_CONFIG" && ! grep -q "server localhost:3000 backup;" "$NGINX_CONFIG"; then
+              echo "PORT_ACTIVE=3000" > ~/port_state.env
+              echo "PORT_NEW=3001" >> ~/port_state.env
+            else
+              echo "PORT_ACTIVE=3001" > ~/port_state.env
+              echo "PORT_NEW=3000" >> ~/port_state.env
+            fi
+
+      - name: Deploy to VPS
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: ".,!node_modules,!.git"
+          target: "/home/${{ secrets.USERNAME }}/admin-new"
+          strip_components: 0
+          overwrite: true
+
+      - name: Build and Start New Container
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: appleboy/ssh-action@master
+        env:
+          AUTH0_POST_LOGOUT_REDIRECT_URI: ${{ secrets.AUTH0_POST_LOGOUT_REDIRECT_URI }}
+          AUTH0_AUDIENCE: ${{ secrets.AUTH0_AUDIENCE }}
+          AUTH0_DOMAIN: ${{ secrets.AUTH0_DOMAIN }}
+          AUTH0_CLIENT_ID: ${{ secrets.AUTH0_CLIENT_ID }}
+          AUTH0_CLIENT_SECRET: ${{ secrets.AUTH0_CLIENT_SECRET }}
+          AUTH0_SECRET: ${{ secrets.AUTH0_SECRET }}
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+          NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
+          AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: AUTH0_DOMAIN,AUTH0_CLIENT_ID,AUTH0_CLIENT_SECRET,AUTH0_SECRET,APP_BASE_URL,NEXT_PUBLIC_API_URL,AZURE_STORAGE_CONNECTION_STRING,AUTH0_POST_LOGOUT_REDIRECT_URI,AUTH0_AUDIENCE
+          script: |
+            cd ~/admin-new
+            
+            # Create env file with proper quotes
+            echo "AUTH0_DOMAIN='$AUTH0_DOMAIN'" > .env
+            echo "AUTH0_POST_LOGOUT_REDIRECT_URI='$AUTH0_POST_LOGOUT_REDIRECT_URI'" >> .env
+            echo "AUTH0_AUDIENCE='$AUTH0_AUDIENCE'" >> .env
+            echo "AUTH0_CLIENT_ID='$AUTH0_CLIENT_ID'" >> .env
+            echo "AUTH0_CLIENT_SECRET='$AUTH0_CLIENT_SECRET'" >> .env
+            echo "AUTH0_SECRET='$AUTH0_SECRET'" >> .env
+            echo "APP_BASE_URL='$APP_BASE_URL'" >> .env
+            echo "NEXT_PUBLIC_API_URL='$NEXT_PUBLIC_API_URL'" >> .env
+            echo "AZURE_STORAGE_CONNECTION_STRING='$AZURE_STORAGE_CONNECTION_STRING'" >> .env
+            chmod 600 .env
+            
+            # Set the specific admin configuration file path
+            NGINX_CONFIG="/etc/nginx/sites-available/admin.empowertech.be"
+            echo "Using Nginx config: $NGINX_CONFIG"
+            
+            # Backup the Nginx config before making changes
+            sudo cp "$NGINX_CONFIG" "$NGINX_CONFIG.bak"
+            
+            # Source the port state environment file
+            source ~/port_state.env
+            echo "Building new container on port $PORT_NEW"
+            
+            # Build new container with the appropriate name and port
+            export CONTAINER_NAME=nextjs_admin_${PORT_NEW}
+            export PORT=${PORT_NEW}
+            
+            # Build and start the new container
+            docker compose build --no-cache
+            docker compose up -d
+            
+            # Wait for container to be healthy
+            echo "Waiting for new container to be ready on port ${PORT_NEW}..."
+            attempt=0
+            max_attempts=30
+            
+            until $(curl --output /dev/null --silent --head --fail http://localhost:${PORT_NEW}); do
+              if [ ${attempt} -eq ${max_attempts} ]; then
+                echo "New container failed to start properly. Rolling back."
+                export CONTAINER_NAME=nextjs_admin_${PORT_NEW} 
+                export PORT=${PORT_NEW}
+                docker compose down
+                exit 1
+              fi
+            
+              printf '.'
+              attempt=$(($attempt+1))
+              sleep 2
+            done
+            
+            echo "New container is ready. Updating Nginx to route traffic."
+            
+            # Make sure we preserve the upstream block structure
+            echo "Updating Nginx configuration..."
+            
+            # First ensure both server lines exist (uncommented)
+            if grep -q "# server localhost:${PORT_NEW}" "$NGINX_CONFIG"; then
+              sudo sed -i "s/# server localhost:${PORT_NEW}/server localhost:${PORT_NEW}/g" "$NGINX_CONFIG"
+            fi
+            
+            # Ensure the active server becomes backup and the new server becomes active
+            sudo sed -i "s/server localhost:${PORT_ACTIVE};/server localhost:${PORT_ACTIVE} backup;/g" "$NGINX_CONFIG"
+            sudo sed -i "s/server localhost:${PORT_NEW} backup;/server localhost:${PORT_NEW};/g" "$NGINX_CONFIG"
+            # If the new server doesn't have the backup flag, also handle that case
+            sudo sed -i "s/server localhost:${PORT_NEW};/server localhost:${PORT_NEW};/g" "$NGINX_CONFIG"
+            
+            # Test Nginx configuration before reload
+            echo "Testing Nginx configuration..."
+            if sudo nginx -t; then
+              echo "Nginx configuration test passed. Reloading..."
+              sudo systemctl reload nginx
+              echo "Nginx updated successfully. New version is live."
+            else
+              echo "Nginx configuration error! Rolling back changes..."
+              sudo cp "$NGINX_CONFIG.bak" "$NGINX_CONFIG"
+              sudo nginx -t && sudo systemctl reload nginx
+            
+              # Stop new container since we're keeping the old one
+              echo "Stopping newly created container..."
+              export CONTAINER_NAME=nextjs_admin_${PORT_NEW}
+              export PORT=${PORT_NEW}
+              docker compose down
+              exit 1
+            fi
+            
+            sleep 5
+            
+            # Stop the old container after a grace period
+            echo "Stopping old container on port ${PORT_ACTIVE}..."
+            cd ~/admin
+            export CONTAINER_NAME=nextjs_admin_${PORT_ACTIVE}
+            export PORT=${PORT_ACTIVE}
+            docker compose down
+            
+            # Clean up after successful deployment
+            mkdir -p ~/admin-backup
+            rm -rf ~/admin-backup/* # Clear previous backup
+            cp -r ~/admin/* ~/admin-backup/ 2>/dev/null || true
+            rm -rf ~/admin/* # Clear admin directory
+            cp -r ~/admin-new/* ~/admin/ 2>/dev/null || true
+            rm -rf ~/admin-new/* # Clear admin-new directory
+            
+            # Cleanup
+            docker system prune -f --volumes
+            docker image prune -f
+            docker builder prune -f --keep-storage 8GB
