@@ -9,6 +9,7 @@ export interface DeveloperLayoutProps {
   /**
    * Child React components to be rendered within the layout
    * Allows for flexible page content composition
+   *
    */
   children: React.ReactNode;
 
