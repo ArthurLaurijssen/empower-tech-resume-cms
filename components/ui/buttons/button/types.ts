@@ -17,8 +17,7 @@ export type Intent =
  *
  * Extends native button attributes with additional styling and content options
  */
-export interface ButtonProps
-  extends React.ButtonHTMLAttributes<HTMLButtonElement> {
+export interface ButtonProps extends React.ComponentPropsWithoutRef<"button"> {
   /**
    * Button content to be rendered
    */
